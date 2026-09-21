@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+data/*.sqlite
+data/*.sqlite-*
+data/*.log
+*.egg-info/
+.venv/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+.DS_Store
+.gstack/

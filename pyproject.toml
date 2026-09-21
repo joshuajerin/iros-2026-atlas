@@ -1,0 +1,24 @@
+[project]
+name = "iros-2026-atlas"
+version = "0.2.0"
+description = "A public, evidence-backed research atlas for IROS 2026."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "mcp>=1.9,<2",
+  "pydantic>=2.7,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+iros-catalog = "iros_catalog.cli:main"
+iros-atlas = "iros_catalog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["iros_catalog*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
