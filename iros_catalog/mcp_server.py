@@ -65,11 +65,17 @@ def allowed_mcp_origins() -> list[str]:
     return _configured_public_origins() or LOCAL_MCP_ORIGINS
 
 
+def stateless_mcp_transport() -> bool:
+    """Use request-scoped MCP transports behind non-sticky serverless routing."""
+    return os.environ.get("IROS_ATLAS_STATELESS_MCP", "").strip().casefold() in {"1", "true", "yes"}
+
+
 def create_mcp(db_path: str | Path) -> FastMCP:
     mcp = FastMCP(
         "IROS 2026 Atlas",
         instructions="Read-only IROS 2026 papers, rankings, topics, institutions, and researchers. Cite returned evidence URLs.",
         streamable_http_path="/",
+        stateless_http=stateless_mcp_transport(),
         max_request_body_size=128_000,
         transport_security=TransportSecuritySettings(allowed_hosts=allowed_mcp_hosts(), allowed_origins=allowed_mcp_origins()),
     )

@@ -103,6 +103,16 @@ class MCPTransportTests(unittest.TestCase):
                 response = client.post("/mcp/", headers={**self.headers, "Origin": "http://localhost:5173"}, json=self.initialize)
                 self.assertEqual(response.status_code, 403)
 
+    def test_stateless_transport_accepts_request_scoped_serverless_calls(self):
+        with patch.dict("os.environ", {"IROS_ATLAS_STATELESS_MCP": "true"}):
+            with TestClient(create_app(self.db), base_url="http://localhost:8080") as client:
+                response = client.post("/mcp/", headers=self.headers, json=self.initialize)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertNotIn("mcp-session-id", response.headers)
+                response = client.post("/mcp/", headers=self.headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertIn("search_papers", {tool["name"] for tool in self.message(response)["result"]["tools"]})
+
     def test_public_url_configures_a_reliable_mcp_endpoint(self):
         public_origin = "https://mcp.irostatlas.example"
         with patch.dict("os.environ", {"IROS_ATLAS_PUBLIC_URL": public_origin}, clear=True):

@@ -69,6 +69,10 @@ export IROS_ATLAS_PUBLIC_URL="https://mcp.example.com"
 .venv/bin/python -m iros_catalog --db data/iros.sqlite serve --port 8080
 ```
 
+For a serverless container platform without sticky request routing, also set
+`IROS_ATLAS_STATELESS_MCP=true`. This keeps Streamable HTTP requests portable
+between warm instances instead of relying on an in-memory MCP session.
+
 This derives the MCP Host-header and browser-origin allowlists from the published domain, so external clients can call the canonical endpoint without a Host override:
 
 ```text
