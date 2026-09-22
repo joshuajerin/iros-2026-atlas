@@ -14,7 +14,24 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .atlas import institution_profile, keyword_network, methodology, overview, paper_detail, rankings, researcher_profile, search_papers, topic_detail
-from .mcp_server import create_mcp
+from .mcp_server import allowed_mcp_origins, create_mcp, public_mcp_endpoint
+
+
+class ScopedCORSMiddleware:
+    """Allow browser MCP sessions only from configured connector origins."""
+
+    def __init__(self, app):
+        headers = ["Accept", "Content-Type", "MCP-Protocol-Version", "Mcp-Session-Id"]
+        self.mcp = CORSMiddleware(
+            app, allow_origins=allowed_mcp_origins(), allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=headers, expose_headers=["Mcp-Session-Id"],
+        )
+        self.rest = CORSMiddleware(app, allow_origins=["*"], allow_methods=["GET"], allow_headers=headers)
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        middleware = self.mcp if path == "/mcp" or path.startswith("/mcp/") else self.rest
+        await middleware(scope, receive, send)
 
 
 class RateLimitMiddleware:
@@ -51,13 +68,22 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     app = FastAPI(title="IROS 2026 Atlas API", version="0.2.0", description="Read-only research map and agent connector for IROS 2026.", lifespan=lifespan)
     app.add_middleware(RateLimitMiddleware)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["Accept", "Content-Type", "MCP-Protocol-Version", "Mcp-Session-Id"])
+    app.add_middleware(ScopedCORSMiddleware)
 
     @app.get("/api/v1/health")
     def health() -> dict:
         try:
             data = overview(database)
-            return {"ok": True, "papers": data["stats"]["papers"], "dataset_built_at": data["built_at"]}
+            return {
+                "ok": True,
+                "papers": data["stats"]["papers"],
+                "dataset_built_at": data["built_at"],
+                "mcp": {
+                    "endpoint": public_mcp_endpoint(),
+                    "transport": "Streamable HTTP",
+                    "authentication": "none",
+                },
+            }
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -77,9 +103,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return item
 
     @app.get("/api/v1/rankings/{kind}")
-    def get_rankings(kind: str, limit: int = Query(default=30, ge=1, le=100), topic: str | None = Query(default=None, max_length=100)) -> dict:
+    def get_rankings(kind: str, limit: int = Query(default=30, ge=1, le=100), offset: int = Query(default=0, ge=0, le=10_000), topic: str | None = Query(default=None, max_length=100)) -> dict:
         try:
-            return rankings(database, kind, limit, topic)
+            return rankings(database, kind, limit, topic, offset=offset)
         except ValueError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 

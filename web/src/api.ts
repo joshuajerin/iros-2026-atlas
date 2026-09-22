@@ -8,10 +8,10 @@ async function request<T>(path: string): Promise<T> {
 
 export const api = {
   overview: () => request<Overview>("/api/v1/overview"),
-  network: () => request<Network>("/api/v1/keywords/network?limit=64"),
+  network: () => request<Network>("/api/v1/keywords/network?limit=120"),
   papers: (params: URLSearchParams) => request<{ count: number; papers: Paper[] }>(`/api/v1/papers?${params}`),
   paper: (id: string) => request<Paper>(`/api/v1/papers/${id}`),
-  rankings: (kind: string, params = "") => request<{ items: RankingItem[]; methodology?: string }>(`/api/v1/rankings/${kind}?${params}`),
+  rankings: (kind: string, params = "") => request<{ count?: number; limit?: number; offset?: number; items: RankingItem[]; methodology?: string }>(`/api/v1/rankings/${kind}?${params}`),
   topic: (slug: string) => request<{ slug: string; label: string; paper_count: number; keywords: { slug: string; label: string; paper_count: number }[]; rankings: Paper[] }>(`/api/v1/topics/${slug}`),
   methodology: () => request<{ version: string; computed_at: string; weights: Record<string, number>; rules: string[] }>("/api/v1/methodology/atlas-score"),
 };

@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from iros_catalog.api import create_app
-from iros_catalog.atlas import build_atlas, methodology, rankings, search_papers
+from iros_catalog.atlas import build_atlas, keyword_network, methodology, rankings, search_papers
 from iros_catalog.catalog import import_official_records
 from iros_catalog.db import initialize
 
@@ -42,3 +42,28 @@ class AtlasTests(unittest.TestCase):
             response = client.post("/mcp/", headers={"Host": "localhost", "Accept": "application/json, text/event-stream", "Content-Type": "application/json"}, json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
             self.assertEqual(response.status_code, 200)
             self.assertIn("IROS 2026 Atlas", response.text)
+
+    def test_entity_ranking_api_validates_and_returns_pagination_metadata(self):
+        with TestClient(create_app(self.db), base_url="http://localhost") as client:
+            response = client.get("/api/v1/rankings/researchers?limit=1&offset=1")
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual((payload["limit"], payload["offset"]), (1, 1))
+            self.assertGreaterEqual(payload["count"], 3)
+            self.assertEqual(len(payload["items"]), 1)
+            self.assertEqual(client.get("/api/v1/rankings/researchers?offset=-1").status_code, 422)
+
+    def test_keyword_nodes_use_the_keyword_semantic_topic_not_a_papers_first_topic(self):
+        # This paper belongs to both topics.  The old derived-data build chose
+        # ``control_and_optimization`` only because it sorts first, which made
+        # clicking Reinforcement Learning open the wrong dashboard branch.
+        import_official_records(str(self.db), [{
+            "pn": "3", "title": "Reinforcement Learning Control for Robots",
+            "authors": "Grace Hopper", "keywords": "Reinforcement Learning; Control",
+            "session": "Robot Learning", "type": "Talk", "affiliations": "Example University",
+            "official_record_url": "https://example.test/3",
+        }])
+        build_atlas(self.db)
+
+        nodes = {node["id"]: node for node in keyword_network(self.db, limit=20)["nodes"]}
+        self.assertEqual(nodes["reinforcement-learning"]["topic"], "learning_and_reinforcement_learning")

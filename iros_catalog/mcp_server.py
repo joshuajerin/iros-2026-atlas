@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -12,15 +13,65 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .atlas import keyword_network, methodology, paper_detail, rankings, search_papers as search_catalog, topic_detail
 
 
+LOCAL_MCP_HOSTS = ["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"]
+LOCAL_MCP_ORIGINS = [
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "http://localhost:8080", "http://127.0.0.1:8080",
+]
+
+
+def _configured_public_origins() -> list[str]:
+    """Return validated public origins from the single deployment setting.
+
+    A named Cloudflare Tunnel preserves the external Host header.  Keeping the
+    published origin in one setting prevents the application and tunnel from
+    drifting into the 421 configuration that a temporary tunnel can cause.
+    """
+    values = [value.strip() for value in os.environ.get("IROS_ATLAS_PUBLIC_URL", "").split(",") if value.strip()]
+    origins: list[str] = []
+    for value in values:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+            raise ValueError(
+                "IROS_ATLAS_PUBLIC_URL must be a comma-separated http(s) origin, "
+                "for example https://mcp.example.com"
+            )
+        if parsed.path not in {"", "/", "/mcp", "/mcp/"}:
+            raise ValueError("IROS_ATLAS_PUBLIC_URL cannot contain an application path")
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def public_mcp_endpoint() -> str | None:
+    """The exact, canonical public Streamable HTTP endpoint when configured."""
+    origins = _configured_public_origins()
+    return f"{origins[0]}/mcp/" if origins else None
+
+
+def allowed_mcp_hosts() -> list[str]:
+    configured = os.environ.get("IROS_ATLAS_ALLOWED_HOSTS")
+    if configured is not None:
+        return [host.strip() for host in configured.split(",") if host.strip()]
+    public_origins = _configured_public_origins()
+    return [urlsplit(origin).netloc for origin in public_origins] or LOCAL_MCP_HOSTS
+
+
+def allowed_mcp_origins() -> list[str]:
+    configured = os.environ.get("IROS_ATLAS_ALLOWED_ORIGINS")
+    if configured is not None:
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return _configured_public_origins() or LOCAL_MCP_ORIGINS
+
+
 def create_mcp(db_path: str | Path) -> FastMCP:
-    allowed_hosts = [host.strip() for host in os.environ.get("IROS_ATLAS_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
-    allowed_origins = [origin.strip() for origin in os.environ.get("IROS_ATLAS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
     mcp = FastMCP(
         "IROS 2026 Atlas",
         instructions="Read-only IROS 2026 papers, rankings, topics, institutions, and researchers. Cite returned evidence URLs.",
         streamable_http_path="/",
         max_request_body_size=128_000,
-        transport_security=TransportSecuritySettings(allowed_hosts=allowed_hosts, allowed_origins=allowed_origins),
+        transport_security=TransportSecuritySettings(allowed_hosts=allowed_mcp_hosts(), allowed_origins=allowed_mcp_origins()),
     )
     path = str(db_path)
 
@@ -43,7 +94,7 @@ def create_mcp(db_path: str | Path) -> FastMCP:
     @mcp.tool()
     def explore_keyword(keyword: str, limit: int = 24) -> dict:
         """Find papers and neighboring conference keywords for a keyword."""
-        return {"papers": search_catalog(path, keyword=keyword, limit=min(max(limit, 1), 50)), "network": keyword_network(path, min(max(limit, 12), 100))}
+        return {"papers": search_catalog(path, keyword=keyword, limit=min(max(limit, 1), 50)), "network": keyword_network(path, min(max(limit, 12), 100), keyword=keyword)}
 
     @mcp.tool()
     def compare_topics(topic_a: str, topic_b: str) -> dict:
@@ -53,24 +104,20 @@ def create_mcp(db_path: str | Path) -> FastMCP:
     @mcp.tool()
     def get_institution(name: str, limit: int = 20) -> dict:
         """Search IROS 2026 institution presence rankings."""
-        items = rankings(path, "institutions", 500)["items"]
-        needle = name.casefold().strip()
-        return {"items": [item for item in items if needle in item["name"].casefold()][:min(max(limit, 1), 50)]}
+        return {"items": rankings(path, "institutions", min(max(limit, 1), 50), name=name)["items"]}
 
     @mcp.tool()
     def get_researcher(name: str, limit: int = 20) -> dict:
         """Search source-name researcher profiles; ambiguous identities remain unmerged."""
-        items = rankings(path, "researchers", 1000)["items"]
-        needle = name.casefold().strip()
-        return {"items": [item for item in items if needle in item["name"].casefold()][:min(max(limit, 1), 50)]}
+        return {"items": rankings(path, "researchers", min(max(limit, 1), 50), name=name)["items"]}
 
     @mcp.tool()
     def discover_related_papers(paper_number: str, limit: int = 6) -> dict:
         """Return topic-adjacent IROS papers for one seed paper."""
-        paper = paper_detail(path, paper_number)
+        paper = paper_detail(path, paper_number, related_limit=min(max(limit, 1), 20))
         if not paper:
             return {"error": "not_found", "paper_number": paper_number}
-        return {"paper_number": paper_number, "related_papers": paper["related_papers"][:min(max(limit, 1), 20)]}
+        return {"paper_number": paper_number, "related_papers": paper["related_papers"]}
 
     @mcp.tool()
     def build_reading_list(topic: str, limit: int = 8) -> dict:

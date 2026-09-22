@@ -60,7 +60,24 @@ https://YOUR-ATLAS-HOST/mcp/
 
 It uses the MCP Streamable HTTP transport and exposes read-only tools: `search_papers`, `get_paper`, `rank_papers`, `explore_keyword`, `compare_topics`, `get_institution`, `get_researcher`, `discover_related_papers`, and `build_reading_list`. Resources include `iros://paper/{number}`, `iros://topic/{slug}`, `iros://rankings/overall`, and `iros://methodology/atlas-score`.
 
-Set `IROS_ATLAS_ALLOWED_HOSTS` and `IROS_ATLAS_ALLOWED_ORIGINS` to comma-separated production values at deployment; the local defaults only permit localhost. Requests are body-size capped and rate-limited by anonymous IP. For private/offline research, the same SQLite snapshot can later be paired with a stdio MCP wrapper; clients without MCP can use OpenAPI directly.
+### Stable public deployment
+
+Do not use a `trycloudflare.com` Quick Tunnel as an agent integration URL: it changes whenever the process restarts. Use a named Cloudflare Tunnel and a stable hostname instead. Set exactly one public setting before starting the API:
+
+```bash
+export IROS_ATLAS_PUBLIC_URL="https://mcp.example.com"
+.venv/bin/python -m iros_catalog --db data/iros.sqlite serve --port 8080
+```
+
+This derives the MCP Host-header and browser-origin allowlists from the published domain, so external clients can call the canonical endpoint without a Host override:
+
+```text
+https://mcp.example.com/mcp/
+```
+
+The supplied [`deploy/cloudflared-config.example.yml`](deploy/cloudflared-config.example.yml) maps that hostname to the local service. Create the DNS route with `cloudflared tunnel route dns iros-atlas mcp.example.com`; Cloudflare will create the required tunnel CNAME in the Cloudflare-managed zone. If the domain remains at Namecheap, first point the domain's nameservers to the two nameservers Cloudflare assigns to the zone. The public health response includes the configured canonical endpoint, transport, and authentication mode for a deployment check.
+
+`IROS_ATLAS_ALLOWED_HOSTS` and `IROS_ATLAS_ALLOWED_ORIGINS` remain available as explicit comma-separated overrides for an unusual proxy topology. Requests are body-size capped and rate-limited by anonymous IP. For private/offline research, the same SQLite snapshot can later be paired with a stdio MCP wrapper; clients without MCP can use OpenAPI directly.
 
 ## Ingestion and release
 

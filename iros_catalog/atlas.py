@@ -18,6 +18,7 @@ from typing import Any
 
 from . import ATLAS_SCORE_VERSION
 from .db import connect, paper_payload
+from .taxonomy import classify
 
 
 TOPIC_LABELS = {
@@ -66,11 +67,21 @@ def _affiliations(raw: str | None) -> list[str]:
     return list(seen.values())
 
 
-def _primary_topic(connection: sqlite3.Connection, paper_number: str) -> str:
-    row = connection.execute(
-        "SELECT topic FROM paper_topics WHERE paper_number=? ORDER BY topic LIMIT 1", (paper_number,)
-    ).fetchone()
-    return row[0] if row else "other_robotics"
+def _keyword_topic(label: str, topic_counts: Counter[str]) -> str:
+    """Assign a stable, intelligible parent topic to a keyword node.
+
+    A paper can belong to more than one taxonomy topic, so its alphabetically
+    first topic is not a reliable proxy for the meaning of every keyword in
+    that paper.  Prefer a topic explicitly matched by the keyword label itself
+    (for example, ``Reinforcement Learning``), then fall back to the topic
+    where the keyword occurs most often in the catalog.
+    """
+    direct_topics = [topic for topic in classify(label) if topic != "other_robotics"]
+    if direct_topics:
+        return direct_topics[0]
+    if topic_counts:
+        return min(topic_counts, key=lambda topic: (-topic_counts[topic], topic))
+    return "other_robotics"
 
 
 def _score(paper: sqlite3.Row) -> tuple[dict[str, float], list[dict[str, str]], float, float]:
@@ -148,11 +159,12 @@ def build_atlas(db_path: str | Path) -> dict[str, int]:
         papers = connection.execute("SELECT * FROM papers ORDER BY CAST(paper_number AS INTEGER)").fetchall()
         for paper in papers:
             number = paper["paper_number"]
-            topic = _primary_topic(connection, number)
+            paper_topics = [row["topic"] for row in connection.execute("SELECT topic FROM paper_topics WHERE paper_number=?", (number,))]
             for label in _keywords(paper["official_keywords"]):
                 slug = _slug(label)
-                row = keyword_rows.setdefault(slug, {"label": label, "topic": topic, "papers": set()})
+                row = keyword_rows.setdefault(slug, {"label": label, "topic_counts": Counter(), "papers": set()})
                 row["papers"].add(number)
+                row["topic_counts"].update(paper_topics or ["other_robotics"])
                 connection.execute(
                     "INSERT INTO atlas_paper_keywords(paper_number,keyword_slug,raw_value) VALUES(?,?,?)",
                     (number, slug, label),
@@ -173,7 +185,7 @@ def build_atlas(db_path: str | Path) -> dict[str, int]:
         for slug, row in keyword_rows.items():
             connection.execute(
                 "INSERT INTO atlas_keywords(slug,label,topic,paper_count) VALUES(?,?,?,?)",
-                (slug, row["label"], row["topic"], len(row["papers"])),
+                (slug, row["label"], _keyword_topic(row["label"], row["topic_counts"]), len(row["papers"])),
             )
         for slug, row in institution_rows.items():
             connection.execute(
@@ -267,10 +279,11 @@ def search_papers(db_path: str | Path, query: str | None = None, topic: str | No
         _metadata(connection)
         conditions, values = [], []
         if query:
-            tokens = re.findall(r"[\w-]+", query.casefold())[:12]
+            tokens = re.findall(r"\w+", query.casefold())[:12]
             if tokens:
                 conditions.append("p.paper_number IN (SELECT paper_number FROM papers_fts WHERE papers_fts MATCH ?)")
-                values.append(" AND ".join(f"{token}*" for token in tokens))
+                # User words are literal prefix terms, never FTS operators.
+                values.append(" AND ".join(f'"{token}"*' for token in tokens))
         if topic:
             conditions.append("EXISTS (SELECT 1 FROM paper_topics pt WHERE pt.paper_number=p.paper_number AND pt.topic=?)")
             values.append(topic)
@@ -289,7 +302,7 @@ def search_papers(db_path: str | Path, query: str | None = None, topic: str | No
         return {"count": total, "limit": limit, "offset": offset, "papers": [_paper_summary(connection, row) for row in rows]}
 
 
-def paper_detail(db_path: str | Path, paper_number: str) -> dict[str, Any] | None:
+def paper_detail(db_path: str | Path, paper_number: str, related_limit: int = 6) -> dict[str, Any] | None:
     with connect(db_path) as connection:
         _metadata(connection)
         paper = connection.execute("SELECT * FROM papers WHERE paper_number=?", (paper_number,)).fetchone()
@@ -302,16 +315,33 @@ def paper_detail(db_path: str | Path, paper_number: str) -> dict[str, Any] | Non
                WHERE p.paper_number != ? AND EXISTS (
                  SELECT 1 FROM paper_topics a JOIN paper_topics b ON a.topic=b.topic
                  WHERE a.paper_number=? AND b.paper_number=p.paper_number
-               ) ORDER BY s.score DESC LIMIT 6""",
-            (paper_number, paper_number),
+               ) ORDER BY s.score DESC, s.confidence DESC, CAST(p.paper_number AS INTEGER) LIMIT ?""",
+            (paper_number, paper_number, min(max(related_limit, 1), 20)),
         ).fetchall()
         payload["related_papers"] = [_paper_summary(connection, row) for row in related]
         return payload
 
 
-def keyword_network(db_path: str | Path, limit: int = 80) -> dict[str, Any]:
+def keyword_network(db_path: str | Path, limit: int = 80, keyword: str | None = None) -> dict[str, Any]:
     with connect(db_path) as connection:
         _metadata(connection)
+        if keyword is not None:
+            seed = connection.execute("SELECT * FROM atlas_keywords WHERE slug=?", (_slug(keyword),)).fetchone()
+            if seed is None:
+                return {"nodes": [], "edges": []}
+            neighbors = connection.execute(
+                """SELECT k.*, COUNT(DISTINCT target.paper_number) AS shared_count
+                   FROM atlas_paper_keywords source
+                   JOIN atlas_paper_keywords target USING(paper_number)
+                   JOIN atlas_keywords k ON k.slug=target.keyword_slug
+                   WHERE source.keyword_slug=? AND target.keyword_slug != ?
+                   GROUP BY k.slug ORDER BY shared_count DESC, k.paper_count DESC, k.label
+                   LIMIT ?""", (seed["slug"], seed["slug"], max(limit - 1, 0))
+            ).fetchall()
+            return {
+                "nodes": [{"id": row["slug"], "label": row["label"], "count": row["paper_count"], "topic": row["topic"]} for row in [seed, *neighbors]],
+                "edges": [{"source": seed["slug"], "target": row["slug"], "count": row["shared_count"]} for row in neighbors],
+            }
         rows = connection.execute("SELECT * FROM atlas_keywords ORDER BY paper_count DESC, label LIMIT ?", (limit,)).fetchall()
         selected = {row["slug"] for row in rows}
         paper_words: defaultdict[str, list[str]] = defaultdict(list)
@@ -328,7 +358,7 @@ def keyword_network(db_path: str | Path, limit: int = 80) -> dict[str, Any]:
         }
 
 
-def rankings(db_path: str | Path, kind: str, limit: int = 30, topic: str | None = None) -> dict[str, Any]:
+def rankings(db_path: str | Path, kind: str, limit: int = 30, topic: str | None = None, name: str | None = None, offset: int = 0) -> dict[str, Any]:
     with connect(db_path) as connection:
         _metadata(connection)
         if kind == "papers":
@@ -337,35 +367,59 @@ def rankings(db_path: str | Path, kind: str, limit: int = 30, topic: str | None 
                 conditions.append("EXISTS (SELECT 1 FROM paper_topics pt WHERE pt.paper_number=p.paper_number AND pt.topic=?)")
                 values.append(topic)
             rows = connection.execute(
-                "SELECT p.* FROM papers p JOIN atlas_scores s USING(paper_number) WHERE " + " AND ".join(conditions) + " ORDER BY s.score DESC, s.confidence DESC LIMIT ?",
-                [*values, limit],
+                "SELECT p.* FROM papers p JOIN atlas_scores s USING(paper_number) WHERE " + " AND ".join(conditions) + " ORDER BY s.score DESC, s.confidence DESC LIMIT ? OFFSET ?",
+                [*values, limit, offset],
             ).fetchall()
             return {"kind": kind, "topic": topic, "items": [_paper_summary(connection, row) for row in rows]}
+        selected_scores = "WITH selected_scores AS (SELECT s.* FROM atlas_scores s"
+        selected_values = []
+        if topic:
+            selected_scores += " WHERE EXISTS (SELECT 1 FROM paper_topics selected_topic WHERE selected_topic.paper_number=s.paper_number AND selected_topic.topic=?)"
+            selected_values.append(topic)
+        selected_scores += ") "
+        # Match source names before ranking/limiting, including Unicode names.
+        connection.create_function("atlas_casefold", 1, str.casefold, deterministic=True)
+        name_values = [name.casefold().strip()] if name is not None else []
         if kind == "institutions":
-            rows = connection.execute(
-                """SELECT i.slug,i.name,i.paper_count, AVG(s.score) AS avg_score, COUNT(DISTINCT pt.topic) AS topic_breadth
+            name_filter = " WHERE instr(atlas_casefold(i.name), ?) > 0" if name is not None else ""
+            ranking_query = """SELECT i.slug,i.name,COUNT(*) AS paper_count, AVG(s.score) AS avg_score,
+                          (SELECT COUNT(DISTINCT pt.topic) FROM paper_topics pt
+                           JOIN atlas_paper_institutions topic_pi USING(paper_number)
+                           JOIN selected_scores topic_scores USING(paper_number)
+                           WHERE topic_pi.institution_slug=i.slug) AS topic_breadth
                    FROM atlas_institutions i JOIN atlas_paper_institutions pi ON pi.institution_slug=i.slug
-                   JOIN atlas_scores s ON s.paper_number=pi.paper_number
-                   LEFT JOIN paper_topics pt ON pt.paper_number=pi.paper_number
-                   GROUP BY i.slug ORDER BY (AVG(s.score) * sqrt(i.paper_count)) DESC LIMIT ?""", (limit,)
+                   JOIN selected_scores s ON s.paper_number=pi.paper_number
+                   """ + name_filter + " GROUP BY i.slug"
+            total = connection.execute(
+                selected_scores + "SELECT COUNT(*) FROM (" + ranking_query + ")", [*selected_values, *name_values]
+            ).fetchone()[0]
+            rows = connection.execute(
+                selected_scores + ranking_query + " ORDER BY (AVG(s.score) * sqrt(COUNT(*))) DESC, i.slug LIMIT ? OFFSET ?", [*selected_values, *name_values, limit, offset]
             ).fetchall()
             items = []
             for row in rows:
                 top_topics = [item[0] for item in connection.execute(
-                    "SELECT pt.topic FROM atlas_paper_institutions pi JOIN paper_topics pt ON pt.paper_number=pi.paper_number WHERE pi.institution_slug=? GROUP BY pt.topic ORDER BY count(*) DESC LIMIT 3", (row["slug"],)
+                    selected_scores + "SELECT pt.topic FROM atlas_paper_institutions pi JOIN paper_topics pt ON pt.paper_number=pi.paper_number JOIN selected_scores s ON s.paper_number=pi.paper_number WHERE pi.institution_slug=? GROUP BY pt.topic ORDER BY count(*) DESC, pt.topic LIMIT 3", [*selected_values, row["slug"]]
                 )]
                 items.append({"id": row["slug"], "name": row["name"], "paper_count": row["paper_count"], "score": round(row["avg_score"] * math.sqrt(row["paper_count"]), 2), "topic_breadth": row["topic_breadth"], "top_topics": top_topics})
-            return {"kind": kind, "items": items, "methodology": "IROS 2026 research presence, not institutional prestige."}
+            return {"kind": kind, "topic": topic, "count": total, "limit": limit, "offset": offset, "items": items, "methodology": "IROS 2026 research presence, not institutional prestige."}
         if kind == "researchers":
-            rows = connection.execute(
-                """SELECT a.id,a.name,COUNT(pa.paper_number) AS paper_count, SUM(s.score * 1.0 / counts.n) AS score,
-                          COUNT(DISTINCT pt.topic) AS topic_breadth
-                   FROM authors a JOIN paper_authors pa ON pa.author_id=a.id JOIN atlas_scores s ON s.paper_number=pa.paper_number
+            name_filter = " WHERE instr(atlas_casefold(a.name), ?) > 0" if name is not None else ""
+            ranking_query = """SELECT a.id,a.name,COUNT(pa.paper_number) AS paper_count, SUM(s.score * 1.0 / counts.n) AS score,
+                          (SELECT COUNT(DISTINCT pt.topic) FROM paper_topics pt
+                           JOIN paper_authors topic_pa USING(paper_number)
+                           JOIN selected_scores topic_scores USING(paper_number)
+                           WHERE topic_pa.author_id=a.id) AS topic_breadth
+                   FROM authors a JOIN paper_authors pa ON pa.author_id=a.id JOIN selected_scores s ON s.paper_number=pa.paper_number
                    JOIN (SELECT paper_number,COUNT(*) AS n FROM paper_authors GROUP BY paper_number) counts ON counts.paper_number=pa.paper_number
-                   LEFT JOIN paper_topics pt ON pt.paper_number=pa.paper_number
-                   GROUP BY a.id ORDER BY score DESC LIMIT ?""", (limit,)
+                   """ + name_filter + " GROUP BY a.id"
+            total = connection.execute(
+                selected_scores + "SELECT COUNT(*) FROM (" + ranking_query + ")", [*selected_values, *name_values]
+            ).fetchone()[0]
+            rows = connection.execute(
+                selected_scores + ranking_query + " ORDER BY score DESC, a.id LIMIT ? OFFSET ?", [*selected_values, *name_values, limit, offset]
             ).fetchall()
-            return {"kind": kind, "items": [{"id": row["id"], "name": row["name"], "paper_count": row["paper_count"], "score": round(row["score"], 2), "topic_breadth": row["topic_breadth"], "identity_confidence": "source_name_only"} for row in rows], "methodology": "Fractional Atlas Score across source names; ambiguous identities are not merged."}
+            return {"kind": kind, "topic": topic, "count": total, "limit": limit, "offset": offset, "items": [{"id": row["id"], "name": row["name"], "paper_count": row["paper_count"], "score": round(row["score"], 2), "topic_breadth": row["topic_breadth"], "identity_confidence": "source_name_only"} for row in rows], "methodology": "Fractional Atlas Score across source names; ambiguous identities are not merged."}
         raise ValueError("kind must be papers, institutions, or researchers")
 
 
@@ -376,8 +430,10 @@ def topic_detail(db_path: str | Path, topic: str) -> dict[str, Any] | None:
         if not count:
             return None
         words = [dict(row) for row in connection.execute(
-            """SELECT k.slug,k.label,k.paper_count FROM atlas_keywords k JOIN atlas_paper_keywords pk ON pk.keyword_slug=k.slug
-               JOIN paper_topics pt ON pt.paper_number=pk.paper_number WHERE pt.topic=? GROUP BY k.slug ORDER BY count(DISTINCT pk.paper_number) DESC LIMIT 16""", (topic,)
+            """SELECT k.slug,k.label,COUNT(DISTINCT pk.paper_number) AS paper_count
+               FROM atlas_keywords k JOIN atlas_paper_keywords pk ON pk.keyword_slug=k.slug
+               JOIN paper_topics pt ON pt.paper_number=pk.paper_number WHERE pt.topic=?
+               GROUP BY k.slug ORDER BY paper_count DESC, k.slug LIMIT 16""", (topic,)
         )]
         return {"slug": topic, "label": TOPIC_LABELS.get(topic, topic.replace("_", " ").title()), "paper_count": count, "keywords": words, "rankings": rankings(db_path, "papers", 12, topic)["items"]}
 

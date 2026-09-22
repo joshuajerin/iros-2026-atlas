@@ -5,7 +5,7 @@ description = "A public, evidence-backed research atlas for IROS 2026."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",
-  "mcp>=1.9,<2",
+  "mcp>=1.30,<2",
   "pydantic>=2.7,<3",
   "uvicorn[standard]>=0.30,<1",
 ]
